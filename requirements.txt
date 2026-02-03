@@ -1,0 +1,4 @@
+pandas==2.3.3
+polars==1.37.1
+polars-runtime-32==1.37.1
+openpyxl

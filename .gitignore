@@ -1,0 +1,4 @@
+__pycache__/
+debug_*/
+cli_test_logs/
+cache/
