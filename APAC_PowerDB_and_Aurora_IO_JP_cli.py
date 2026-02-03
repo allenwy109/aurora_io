@@ -185,6 +185,7 @@ import numpy as np
 import polars as pl
 import os
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 import sqlalchemy
 import getpass
 import datetime as dt
@@ -204,6 +205,8 @@ force_update = False
 SQL_CHUNKSIZE = 2000
 SQL_CHUNKSIZE_LARGE = 10000
 SQL_CHUNKSIZE_LARGE_ROWS = 50000
+SQL_UPLOAD_MAX_RETRIES = 3
+SQL_UPLOAD_RETRY_SLEEP = 5
 _country_tag = re.sub(r"[^A-Za-z0-9]+", "", country).lower()
 HASH_CACHE_PATH = os.path.join("cache", f"write_hashes_{_country_tag}.json")
 READ_HASH_CACHE_PATH = os.path.join("cache", f"read_hashes_{_country_tag}.json")
@@ -1265,9 +1268,53 @@ def upload_sql(engine, df, dest_sql, existMethod, skip_hash_check=False):
     chunksize = SQL_CHUNKSIZE_LARGE if row_count >= SQL_CHUNKSIZE_LARGE_ROWS else SQL_CHUNKSIZE
     if row_count >= SQL_CHUNKSIZE_LARGE_ROWS:
         log_step("upload_sql", f"{dest_sql}: rows={row_count} use chunksize={chunksize}")
-    df_to_upload.to_sql(dest_sql, con=engine,
-              if_exists=existMethod, index=False,
-              chunksize=chunksize, dtype=df_dict)
+    def _is_comm_failure(err):
+        msg = str(err)
+        return (
+            "08S01" in msg
+            or "Communication link failure" in msg
+            or "TCP Provider" in msg
+            or "10060" in msg
+        )
+
+    attempt = 0
+    while True:
+        try:
+            with engine.begin() as conn:
+                df_to_upload.to_sql(
+                    dest_sql,
+                    con=conn,
+                    if_exists=existMethod,
+                    index=False,
+                    chunksize=chunksize,
+                    dtype=df_dict,
+                )
+            break
+        except OperationalError as exc:
+            if _is_comm_failure(exc) and attempt < SQL_UPLOAD_MAX_RETRIES:
+                attempt += 1
+                log_step(
+                    "upload_sql",
+                    f"{dest_sql}: OperationalError (08S01) retry {attempt}/{SQL_UPLOAD_MAX_RETRIES} after {SQL_UPLOAD_RETRY_SLEEP}s",
+                )
+                try:
+                    engine.dispose()
+                except Exception:
+                    pass
+                time.sleep(SQL_UPLOAD_RETRY_SLEEP)
+                continue
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+            raise
+        except Exception:
+            # ensure we don't leave a pending transaction on failures
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+            raise
     record_hash(dest_sql, df_to_upload)
     return
 
