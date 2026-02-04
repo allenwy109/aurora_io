@@ -184,7 +184,7 @@ except Exception:
 import numpy as np
 import polars as pl
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.exc import OperationalError
 import sqlalchemy
 import getpass
@@ -216,8 +216,8 @@ aid_country = re.sub(' ', '', country)
 aurora_sqldb = 'ANVDEVSQLVPM01'
 #aurora_sqldb = 'SIND8M3BR42\SINSQLINTDEV02'
 #aurora_sqldb = 'BEID3LZ6132\BEISQLINTDEV01'
-aurora_dbname = 'Aurora_APAC_DEV_' + aid_country
-#aurora_dbname = 'Aurora_APAC_DEV_' + aid_country + '_test' #Allen test db
+#aurora_dbname = 'Aurora_APAC_DEV_' + aid_country
+aurora_dbname = 'Aurora_APAC_DEV_' + aid_country + '_test' #Allen test db
 # aurora_dbname = 'Aurora_APAC_DEV'
 path = r'L:\Power_Renewables\Inputs\APAC_Transmission_China.xlsm'
 sheetname_line = 'LiveUpdate'
@@ -823,6 +823,7 @@ def aggregate_plant_list(df_plantlist, yr_start, yr_end, step, name_prefix, offs
         columns=['Yr', 'Name', 'Resource_Group', 'zREM Technology', 'Fuel', 'Capacity', 'zREM County', 'zREM State',
                  'Area', 'Resource Group'])
         for i, row in df_plant_blk.iterrows()]
+        frames = [f for f in frames if not f.empty and not f.isna().all(axis=None)]
         df_ppA = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
             columns=['Yr', 'Name', 'Resource_Group', 'zREM Technology', 'Fuel', 'Capacity', 'zREM County', 'zREM State',
                      'Area', 'Resource Group']
@@ -2789,6 +2790,21 @@ def init_environment():
         "Trusted_Connection=Yes"
     )
     engine_dest = create_engine("mssql+pyodbc:///?odbc_connect=%s" % params_dest, fast_executemany=True)
+
+    def _enable_fast_executemany(engine):
+        try:
+            @event.listens_for(engine, "before_cursor_execute")
+            def _set_fast_executemany(conn, cursor, statement, parameters, context, executemany):
+                if executemany:
+                    try:
+                        cursor.fast_executemany = True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    _enable_fast_executemany(engine_src)
+    _enable_fast_executemany(engine_dest)
 
     log("init: load topology and assumptions")
     dict_zone, dict_zone_mkt, dict_mkt_country, df_zone, df_area = get_sql_topology_to_aid(
