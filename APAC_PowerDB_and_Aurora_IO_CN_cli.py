@@ -897,14 +897,10 @@ def aggregate_plant_list(df_plantlist, yr_start, yr_end, step, name_prefix, offs
     df_existing_cummulative['Yr'] = df_existing_cummulative['Yr'].astype('int')
     df_existing_cummulative = df_existing_cummulative[(df_existing_cummulative['Yr'] >= 2000) & (df_existing_cummulative['Yr'] <= yr_end)]
     df_existing_cummulative = df_existing_cummulative[df_existing_cummulative['Capacity'] != 0]
-    # 对于相同(grouping, StartYear)的记录取最大endyr，避免重复ID
+    # 对于相同(grouping, StartYear)的记录取最大endyr
     df_existing_cummulative['endyr'] = df_existing_cummulative.groupby(
         ['Resource_Group', 'zREM Technology', 'Fuel', 'zREM County', 'zREM State', 'Area', 'Resource Group', 'StartYear']
     )['endyr'].transform('max')
-    # After normalizing endyr, drop any duplicated rows on the grouping key
-    df_existing_cummulative = df_existing_cummulative.drop_duplicates(
-        subset=['Resource_Group', 'zREM Technology', 'Fuel', 'zREM County', 'zREM State', 'Area', 'Resource Group', 'StartYear', 'endyr']
-    ).reset_index(drop=True)
 
     # when aggregating, create Storage Max Annual_TS for battery types
     df_existing_cummulative['StorageMaxCap'] = np.where(df_existing_cummulative['Resource Group'].isin(ba_list), df_existing_cummulative[
@@ -1128,6 +1124,13 @@ def _filter_year_range(df, year_start, year_end):
 
     return df
 
+def _skip_year_filter_for_table(dest_sql):
+    # Do not clip year columns for time series annual or plant list outputs.
+    if not dest_sql:
+        return False
+    name = dest_sql.lower()
+    return name in ("tbl_aid_time_series_annual", "tbl_aid_resources")
+
 def _get_column_info(engine, table_name, column_name):
     schema, table = _split_table_name(table_name)
     sql = """
@@ -1229,7 +1232,9 @@ def upload_sql(engine, df, dest_sql, existMethod, skip_hash_check=False):
     Returns         : nothing
     """
 
-    df_to_upload = _filter_year_range(df, demand_year_start, demand_year_end)
+    df_to_upload = df
+    if not _skip_year_filter_for_table(dest_sql):
+        df_to_upload = _filter_year_range(df, demand_year_start, demand_year_end)
     if debug_write_csv(df_to_upload, dest_sql):
         return
 
