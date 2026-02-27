@@ -192,7 +192,6 @@ import datetime as dt
 import calendar
 import re
 import time
-import glob
 import hashlib
 import json
 
@@ -210,15 +209,17 @@ SQL_UPLOAD_RETRY_SLEEP = 5
 _country_tag = re.sub(r"[^A-Za-z0-9]+", "", country).lower()
 HASH_CACHE_PATH = os.path.join("cache", f"write_hashes_{_country_tag}.json")
 READ_HASH_CACHE_PATH = os.path.join("cache", f"read_hashes_{_country_tag}.json")
+TS_ANNUAL_IDS_CACHE_PATH = os.path.join("cache", f"ts_annual_ids_{_country_tag}.json")
 TS_ANNUAL_TRUNCATED = False
+TS_ANNUAL_IDS_THIS_RUN = {}
 
 # <editor-fold desc="Global Variables">
 aid_country = re.sub(' ', '', country)
 aurora_sqldb = 'ANVDEVSQLVPM01'
 #aurora_sqldb = 'SIND8M3BR42\SINSQLINTDEV02'
 #aurora_sqldb = 'BEID3LZ6132\BEISQLINTDEV01'
-aurora_dbname = 'Aurora_APAC_DEV_' + aid_country
-#aurora_dbname = 'Aurora_APAC_DEV_' + 'China' + '_test' #Allen test db
+#aurora_dbname = 'Aurora_APAC_DEV_' + aid_country
+aurora_dbname = 'Aurora_APAC_DEV_' + 'China' + '_test' #Allen test db
 # aurora_dbname = 'Aurora_APAC_DEV'
 path = r''
 sheetname_line = 'LiveUpdate'
@@ -310,9 +311,9 @@ def step_ready(step_name):
     if step_name == "shapes":
         return TS_Weekly is not None and TS_Monthly is not None and Maint_mth is not None and Maint_wk is not None
     if step_name == "plants_existing":
-        return PlantExisting is not None
+        return PlantExisting is not None and TS_Annual_PlantExisting is not None and TS_StorageMax_Exist is not None
     if step_name == "plants_newbuild":
-        return Plant_New is not None
+        return Plant_New is not None and TS_Annual_PlantNew is not None and TS_StorageMax_New is not None
     if step_name == "resources":
         if country not in wind_midterm_excluded:
             return PlantExisting is not None and Plant_New is not None and ts_annual_assumptions is not None and PlantWind is not None
@@ -688,7 +689,7 @@ def apply_emissions(df):
     #comments out when the price data is ready with planttype
     df['EmissionPrice'] = 'ER_' + df['EmissionPrice'].astype(str).str.split('_', n=1).str[-1]
 
-    emission_rate = df[['Name', 'EmissionRate']].copy().copy() # can add other cols if needed
+    emission_rate = df[['Name', 'EmissionRate']].copy() # can add other cols if needed
     emission_rate['ID'] =  emission_rate['EmissionRate']
     emission_rate['EmissionRate'] = 'yr_' + emission_rate['EmissionRate'].astype(str).str.split('_', n=1).str[-1]
     emission_rate.rename(columns ={'EmissionRate':'Rate'}, inplace = True)
@@ -698,7 +699,7 @@ def apply_emissions(df):
 
 
 
-    emission_price = df[['Name', 'EmissionPrice']].copy().copy() # can add other cols if needed
+    emission_price = df[['Name', 'EmissionPrice']].copy() # can add other cols if needed
     emission_price['ID'] = emission_price['EmissionPrice']
     emission_price['EmissionPrice'] = 'yr_' + emission_price['EmissionPrice'].astype(str).str.split('_', n=1).str[-1]
     emission_price.rename(columns ={'EmissionPrice':'Price'}, inplace = True)
@@ -1082,6 +1083,15 @@ def _align_to_table_columns(engine, table_name, df):
     ordered_cols = [c for c in table_cols if c in df.columns]
     return df[ordered_cols]
 
+
+def _skip_year_filter_for_table(dest_sql):
+    # Do not clip year columns for time series annual or plant list outputs.
+    if not dest_sql:
+        return False
+    name = dest_sql.lower()
+    return name in ("tbl_aid_time_series_annual", "tbl_aid_resources")
+
+
 def _filter_year_range(df, year_start, year_end):
     if df is None or (year_start is None and year_end is None):
         return df
@@ -1218,7 +1228,7 @@ def execute_sqlcur(engine, sql):
     cursor.close()
     return
 
-def upload_sql(engine, df, dest_sql, existMethod, skip_hash_check=False):
+def upload_sql(engine, df, dest_sql, existMethod, skip_hash_check=False, module_key=None, skip_id_delete=False):
     """
 
     Function that uploads df to SQL Server using Pandas' DataFrame.to_sql()
@@ -1232,21 +1242,32 @@ def upload_sql(engine, df, dest_sql, existMethod, skip_hash_check=False):
     Returns         : nothing
     """
 
-    df_to_upload = _filter_year_range(df, demand_year_start, demand_year_end)
+    df_to_upload = df
+    if not _skip_year_filter_for_table(dest_sql):
+        df_to_upload = _filter_year_range(df, demand_year_start, demand_year_end)
     if debug_write_csv(df_to_upload, dest_sql):
         return
+
+    ids = []
+    if dest_sql == 'tbl_AID_Time_Series_Annual' and df_to_upload is not None and 'ID' in df_to_upload.columns:
+        ids = [i for i in df_to_upload['ID'].dropna().unique().tolist() if str(i).strip() != ""]
+        _register_ts_annual_ids(module_key, ids)
 
     if not skip_hash_check and should_skip_write(dest_sql, df_to_upload):
         return
 
     global TS_ANNUAL_TRUNCATED
-    if dest_sql == 'tbl_AID_Time_Series_Annual' and not TS_ANNUAL_TRUNCATED:
+    if dest_sql == 'tbl_AID_Time_Series_Annual' and force_update and not TS_ANNUAL_TRUNCATED:
         if debug_mode:
             log_step("upload_sql", "debug: skip truncate tbl_AID_Time_Series_Annual (first write)")
         else:
             log_step("upload_sql", "truncate tbl_AID_Time_Series_Annual (first write)")
             execute_sqlcur(engine=engine_dest, sql="TRUNCATE TABLE tbl_AID_Time_Series_Annual")
         TS_ANNUAL_TRUNCATED = True
+
+    if dest_sql == 'tbl_AID_Time_Series_Annual' and not force_update and not debug_mode and not skip_id_delete:
+        if ids:
+            _delete_ids_in_chunks(dest_sql, ids)
 
     df_to_upload = _ensure_primary_key(engine, dest_sql, df_to_upload, existMethod)
     df_to_upload = _align_to_table_columns(engine, dest_sql, df_to_upload)
@@ -1342,7 +1363,7 @@ def reload_tbl(engine, dest_tbl, dest_df):
 
     return
 
-def update_aid_id(dest_tbl, dest_df):
+def update_aid_id(dest_tbl, dest_df, module_key=None):
     """
 
     Function that REPLACES (by ID) Aurora tables with dataframes
@@ -1369,11 +1390,14 @@ def update_aid_id(dest_tbl, dest_df):
         log_step("update_aid_id", f"skip update for {dest_tbl} (no valid ID)")
         return
 
+    if dest_tbl == 'tbl_AID_Time_Series_Annual':
+        _register_ts_annual_ids(module_key, ids)
+
     if should_skip_write(dest_tbl, dest_df):
         return
 
     global TS_ANNUAL_TRUNCATED
-    if dest_tbl == 'tbl_AID_Time_Series_Annual' and not TS_ANNUAL_TRUNCATED:
+    if dest_tbl == 'tbl_AID_Time_Series_Annual' and force_update and not TS_ANNUAL_TRUNCATED:
         if debug_mode:
             log_step("update_aid_id", "debug: skip truncate tbl_AID_Time_Series_Annual (first write)")
         else:
@@ -1383,13 +1407,32 @@ def update_aid_id(dest_tbl, dest_df):
 
     if debug_mode:
         log_step("update_aid_id", f"debug: skip delete for {dest_tbl}")
-        upload_sql(engine=engine_dest, df=dest_df, dest_sql=dest_tbl, existMethod='append', skip_hash_check=True)
+        upload_sql(
+            engine=engine_dest,
+            df=dest_df,
+            dest_sql=dest_tbl,
+            existMethod='append',
+            skip_hash_check=True,
+            module_key=module_key,
+            skip_id_delete=True,
+        )
         return
 
-    str_id = """('""" + """','""".join([str(i) for i in ids]) + """')"""
-    del_sql = """DELETE FROM """ + dest_tbl + """ WHERE [ID] IN """ + str_id
-    execute_sqlcur(engine=engine_dest, sql=del_sql)
-    upload_sql(engine=engine_dest, df=dest_df, dest_sql=dest_tbl, existMethod='append', skip_hash_check=True)
+    if dest_tbl == 'tbl_AID_Time_Series_Annual' and not force_update:
+        _delete_ids_in_chunks(dest_tbl, ids)
+    else:
+        str_id = """('""" + """','""".join([str(i).replace("'", "''") for i in ids]) + """')"""
+        del_sql = """DELETE FROM """ + dest_tbl + """ WHERE [ID] IN """ + str_id
+        execute_sqlcur(engine=engine_dest, sql=del_sql)
+    upload_sql(
+        engine=engine_dest,
+        df=dest_df,
+        dest_sql=dest_tbl,
+        existMethod='append',
+        skip_hash_check=True,
+        module_key=module_key,
+        skip_id_delete=True,
+    )
 
     return
 
@@ -2369,7 +2412,7 @@ def get_sql_wind_plant_existing(src_sql, country):
 
     return df
 
-def get_sql_fuel_to_aid(src_sql):
+def get_sql_fuel_to_aid(src_sql, country):
     """
 
     Function that reads APAC Fuel Prices from SQL Server and Transforms it to 2 Aurora Input tables.
@@ -2385,6 +2428,13 @@ def get_sql_fuel_to_aid(src_sql):
 
     sql_qry = """SELECT * FROM """ + src_sql
     df = pd.read_sql_query(sql_qry, engine_src)
+    japan_zones = list(dict_zone_mkt.keys())
+    mask = (
+        (df['Level'] == 'All') |
+        ((df['Level'] == 'Country') & (df['LevelName'] == country)) |
+        ((df['Level'] == 'ModelZone') & (df['LevelName'].isin(japan_zones)))
+    )
+    df = df[mask].copy()
     df = df.drop(['Metric'], axis=1)
     df = pd.pivot_table(df, index=['Level', 'LevelName', 'FuelName', 'Description', 'FuelType', 'Units'],
                               columns='Year', values='Value', fill_value=0).reset_index()
@@ -2427,7 +2477,7 @@ def apply_solar_wind_shapes_to_plants(df_maint_mth, df_plant):
 
     return df_plant
 
-def get_sql_fuel_max_to_aid(src_sql):
+def get_sql_fuel_max_to_aid(src_sql, country):
     """
 
     Function that reads APAC Fuel Prices from SQL Server and Transforms it to 2 Aurora Input tables.
@@ -2442,6 +2492,13 @@ def get_sql_fuel_max_to_aid(src_sql):
     """
     sql_qry = """SELECT * FROM """ + src_sql
     df = pd.read_sql_query(sql_qry, engine_src)
+    japan_zones = list(dict_zone_mkt.keys())
+    mask = (
+        (df['Level'] == 'All') |
+        ((df['Level'] == 'Country') & (df['LevelName'] == country)) |
+        ((df['Level'] == 'ModelZone') & (df['LevelName'].isin(japan_zones)))
+    )
+    df = df[mask].copy()
     #df = df.drop(['Metric'], axis=1)
     df = pd.pivot_table(df, index=['Metric', 'Level', 'LevelName', 'FuelName', 'Description', 'FuelType', 'Units'],
                               columns='Year', values='Value', fill_value=0).reset_index()
@@ -2543,12 +2600,95 @@ def _hash_inputs(dfs):
         hasher.update(h.encode("utf-8"))
     return hasher.hexdigest()
 
-def should_skip_read(step_key, dfs):
+def _normalize_id_list(ids):
+    if not ids:
+        return []
+    normed = []
+    for item in ids:
+        if item is None:
+            continue
+        s = str(item).strip()
+        if not s:
+            continue
+        normed.append(s)
+    return sorted(set(normed))
+
+def _load_ts_annual_ids_cache():
+    return _load_hash_cache_path(TS_ANNUAL_IDS_CACHE_PATH)
+
+def _write_ts_annual_ids_cache(data):
+    _write_hash_cache_path(TS_ANNUAL_IDS_CACHE_PATH, data)
+
+def _register_ts_annual_ids(module_key, ids):
+    if not module_key:
+        module_key = "unknown"
+    ids_norm = _normalize_id_list(ids)
+    if not ids_norm:
+        return
+    current = TS_ANNUAL_IDS_THIS_RUN.get(module_key, [])
+    merged = sorted(set(current).union(ids_norm))
+    TS_ANNUAL_IDS_THIS_RUN[module_key] = merged
+
+def _register_ts_annual_ids_from_cache(module_key):
+    if not module_key:
+        return
+    data = _load_ts_annual_ids_cache()
+    ids = data.get("modules", {}).get(module_key, {}).get("ids", [])
+    _register_ts_annual_ids(module_key, ids)
+
+def _delete_ids_in_chunks(dest_tbl, ids, chunk_size=500):
+    ids = _normalize_id_list(ids)
+    if not ids:
+        return
+    for i in range(0, len(ids), chunk_size):
+        chunk = ids[i : i + chunk_size]
+        safe_ids = [s.replace("'", "''") for s in chunk]
+        str_id = "('" + "','".join(safe_ids) + "')"
+        del_sql = f"DELETE FROM {dest_tbl} WHERE [ID] IN {str_id}"
+        execute_sqlcur(engine=engine_dest, sql=del_sql)
+
+def finalize_ts_annual_ids_cleanup():
+    if force_update or not TS_ANNUAL_IDS_THIS_RUN:
+        if TS_ANNUAL_IDS_THIS_RUN:
+            data = _load_ts_annual_ids_cache()
+            modules = data.get("modules", {})
+            now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for key, ids in TS_ANNUAL_IDS_THIS_RUN.items():
+                modules[key] = {"ids": ids, "updated": now}
+            all_ids = sorted(set().union(*[set(m.get("ids", [])) for m in modules.values()])) if modules else []
+            data["modules"] = modules
+            data["all_ids"] = all_ids
+            data["updated"] = now
+            _write_ts_annual_ids_cache(data)
+        return
+
+    data = _load_ts_annual_ids_cache()
+    modules = data.get("modules", {})
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for key, ids in TS_ANNUAL_IDS_THIS_RUN.items():
+        modules[key] = {"ids": ids, "updated": now}
+
+    current_all = sorted(set().union(*[set(m.get("ids", [])) for m in modules.values()])) if modules else []
+    previous_all = set(data.get("all_ids", []))
+    stale_ids = sorted(previous_all.difference(set(current_all)))
+
+    if stale_ids and not debug_mode:
+        log_step("ts_annual_cleanup", f"delete stale IDs rows={len(stale_ids)}")
+        _delete_ids_in_chunks("tbl_AID_Time_Series_Annual", stale_ids)
+
+    data["modules"] = modules
+    data["all_ids"] = current_all
+    data["updated"] = now
+    _write_ts_annual_ids_cache(data)
+
+def should_skip_read(step_key, dfs, ts_annual_module_key=None):
     if force_update:
         return False
     h = _hash_inputs(dfs)
     data = _load_hash_cache_path(READ_HASH_CACHE_PATH)
     if data.get(step_key, {}).get("hash") == h:
+        if ts_annual_module_key:
+            _register_ts_annual_ids_from_cache(ts_annual_module_key)
         return True
     data[step_key] = {
         "hash": h,
@@ -2795,10 +2935,11 @@ def init_environment():
     global user, timestamp, datasetname
     global engine_src, engine_dest
     global dict_zone, dict_zone_mkt, dict_mkt_country, df_zone, df_area, Assumptions
-    global TS_ANNUAL_TRUNCATED
+    global TS_ANNUAL_TRUNCATED, TS_ANNUAL_IDS_THIS_RUN
 
     log("init: start")
     TS_ANNUAL_TRUNCATED = False
+    TS_ANNUAL_IDS_THIS_RUN = {}
     user = getpass.getuser()
     timestamp = dt.datetime.now().replace(microsecond=0)
     datasetname = str(timestamp)
@@ -2965,12 +3106,12 @@ def run_transmission():
     )
     log_df_info(f"{step} links", transmission_link)
     log_df_info(f"{step} ts_annual", ts_annual_txlink)
-    if should_skip_read(step, [transmission_link, ts_annual_txlink]):
+    if should_skip_read(step, [transmission_link, ts_annual_txlink], ts_annual_module_key="transmission"):
         log_step(step, "read hash unchanged; skip compute/write")
         return
     log_step(step, "write transmission tables start")
     reload_tbl(engine=engine_dest, dest_tbl='tbl_AID_Transmission_Links', dest_df=transmission_link)
-    update_aid_id(dest_tbl='tbl_AID_Time_Series_Annual', dest_df=ts_annual_txlink)
+    update_aid_id(dest_tbl='tbl_AID_Time_Series_Annual', dest_df=ts_annual_txlink, module_key="transmission")
     log_step(step, "write transmission tables done")
 
 
@@ -3167,7 +3308,7 @@ def run_resources_load():
     if PlantExisting is None or Plant_New is None:
         log_step(step, "missing inputs; skip compute/write")
         return
-    if should_skip_read(step, [PlantExisting, Plant_New, PlantWind, ts_annual_assumptions]):
+    if should_skip_read(step, [PlantExisting, Plant_New, PlantWind, ts_annual_assumptions], ts_annual_module_key="resources"):
         log_step(step, "read hash unchanged; skip compute/write")
         return
     log_df_info(f"{step} PlantExisting", PlantExisting)
@@ -3182,7 +3323,7 @@ def run_resources_load():
     df_resources_raw = pd.concat(frames, axis=0, ignore_index=True) if frames else pd.DataFrame()
     log_df_info(f"{step} combined resources raw", df_resources_raw)
     log_step(step, "update time series annual start (assumptions)")
-    update_aid_id(dest_tbl='tbl_AID_Time_Series_Annual', dest_df=ts_annual_assumptions)
+    update_aid_id(dest_tbl='tbl_AID_Time_Series_Annual', dest_df=ts_annual_assumptions, module_key="resources")
     log_step(step, f"update time series annual done (assumptions) rows={len(ts_annual_assumptions)}")
 
 
@@ -3216,10 +3357,10 @@ def run_fuel():
     global ts_annual_fuel, Fuel
     step = "fuel"
     log_step(step, "read fuel from SQL start")
-    ts_annual_fuel, Fuel = get_sql_fuel_to_aid(src_sql='vAPAC_Plant_Fuel_Price_Annual_LIVE')
+    ts_annual_fuel, Fuel = get_sql_fuel_to_aid(src_sql='vAPAC_Plant_Fuel_Price_Annual_LIVE', country=country)
     log_df_info(f"{step} fuel", Fuel)
     log_df_info(f"{step} ts_annual", ts_annual_fuel)
-    if should_skip_read(step, [ts_annual_fuel, Fuel]):
+    if should_skip_read(step, [ts_annual_fuel, Fuel], ts_annual_module_key="fuel"):
         log_step(step, "read hash unchanged; skip compute/write")
         return
 
@@ -3240,7 +3381,7 @@ def run_fuel():
     TS_Annual_Price['ID'] = 'Price_' + TS_Annual_Price['ID']
     log_df_info(f"{step} ts_annual_price", TS_Annual_Price)
     log_step(step, "update tbl_AID_Time_Series_Annual start")
-    update_aid_id(dest_tbl='tbl_AID_Time_Series_Annual', dest_df=TS_Annual_Price)
+    update_aid_id(dest_tbl='tbl_AID_Time_Series_Annual', dest_df=TS_Annual_Price, module_key="fuel")
     log_step(step, f"update tbl_AID_Time_Series_Annual done rows={len(TS_Annual_Price)}")
 
 
@@ -3406,10 +3547,10 @@ def run_storage():
 def run_constraints():
     step = "constraints"
     log_step(step, "read fuel constraints from SQL start")
-    ts_annual_fuelmax, FuelMax = get_sql_fuel_max_to_aid(src_sql='vAPAC_Plant_Fuel_MinMax_Annual_LIVE')
+    ts_annual_fuelmax, FuelMax = get_sql_fuel_max_to_aid(src_sql='vAPAC_Plant_Fuel_MinMax_Annual_LIVE', country=country)
     log_df_info(f"{step} fuelmax", FuelMax)
     log_df_info(f"{step} ts_annual", ts_annual_fuelmax)
-    if should_skip_read(step, [ts_annual_fuelmax, FuelMax]):
+    if should_skip_read(step, [ts_annual_fuelmax, FuelMax], ts_annual_module_key="constraints"):
         log_step(step, "read hash unchanged; skip compute/write")
         return
     log_step(step, "write tbl_AID_Constraint start")
@@ -3423,7 +3564,7 @@ def run_constraints():
                                         'Limit Units', 'Limit Type', 'Chronological Method', 'Limit'], axis=1)
     log_df_info(f"{step} ts_annual_max", TS_Annual_Max)
     log_step(step, "update tbl_AID_Time_Series_Annual start")
-    update_aid_id(dest_tbl='tbl_AID_Time_Series_Annual', dest_df=TS_Annual_Max)
+    update_aid_id(dest_tbl='tbl_AID_Time_Series_Annual', dest_df=TS_Annual_Max, module_key="constraints")
     log_step(step, f"update tbl_AID_Time_Series_Annual done rows={len(TS_Annual_Max)}")
     if Fuel is None:
         raise RuntimeError("Fuel is None; run fuel step before constraints")
@@ -3481,12 +3622,14 @@ def run_all_modules():
     run_storage()
     if df_resourceGroup is None or df_resource is None or storage_table is None:
         log_step("final_tables", "missing inputs; skip compute/write")
+        finalize_ts_annual_ids_cleanup()
         return
     log_step("final_tables", "write final resource tables start")
     reload_tbl(engine=engine_dest, dest_tbl='tbl_AID_Resource_Groups', dest_df=df_resourceGroup)
     reload_tbl(engine=engine_dest, dest_tbl='tbl_AID_Resources', dest_df=df_resource)
     reload_tbl(engine=engine_dest, dest_tbl='tbl_AID_Storage', dest_df=storage_table)
     log_step("final_tables", "write final resource tables done")
+    finalize_ts_annual_ids_cleanup()
 
 
 def run_clone_operating_rules():
@@ -3514,7 +3657,13 @@ def run_clone_operating_rules():
     upload_sql(engine=engine_dest, df=df_op, dest_sql='tbl_AID_Operating_Rules', existMethod='append')
     log_step(step, f"append operating rules done rows={len(df_op)}")
     log_step(step, "append operating rule values start")
-    upload_sql(engine=engine_dest, df=df_op_values, dest_sql='tbl_AID_Time_Series_Annual', existMethod='append')
+    upload_sql(
+        engine=engine_dest,
+        df=df_op_values,
+        dest_sql='tbl_AID_Time_Series_Annual',
+        existMethod='append',
+        module_key="operating_rules",
+    )
     log_step(step, f"append operating rule values done rows={len(df_op_values)}")
 
 
