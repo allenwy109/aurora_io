@@ -3193,6 +3193,10 @@ def run_shapes():
             TS_Monthly.loc[maint_mask, clamp_cols] = TS_Monthly.loc[maint_mask, clamp_cols].apply(
                 pd.to_numeric, errors='coerce'
             ).clip(lower=0)
+    # clamp weekly shape values (168-hour columns) to >= 0 as well
+    hr_cols = [c for c in TS_Weekly.columns if isinstance(c, (int, float))]
+    if hr_cols:
+        TS_Weekly[hr_cols] = TS_Weekly[hr_cols].apply(pd.to_numeric, errors='coerce').clip(lower=0)
     log_step(step, "write weekly/monthly tables start")
     reload_tbl(engine=engine_dest, dest_tbl='tbl_AID_Time_Series_Weekly', dest_df=TS_Weekly)
     reload_tbl(engine=engine_dest, dest_tbl='tbl_AID_Time_Series_Monthly', dest_df=TS_Monthly)
