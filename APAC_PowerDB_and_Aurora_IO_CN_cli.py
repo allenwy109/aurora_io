@@ -200,7 +200,7 @@ cycle = 'test2060'
 debug_mode = False
 global_dry_run = False
 debug_run_ts = None
-force_update = False
+force_update = True
 SQL_CHUNKSIZE = 2000
 SQL_CHUNKSIZE_LARGE = 10000
 SQL_CHUNKSIZE_LARGE_ROWS = 50000
@@ -221,7 +221,6 @@ aurora_sqldb = 'ANVDEVSQLVPM01'
 #aurora_dbname = 'Aurora_APAC_DEV_' + aid_country
 aurora_dbname = 'Aurora_APAC_DEV_' + aid_country + '_test' #Allen test db
 # aurora_dbname = 'Aurora_APAC_DEV'
-path = r'L:\Power_Renewables\Inputs\APAC_Transmission_China.xlsm'
 sheetname_line = 'LiveUpdate'
 sheetname_price = 'T&D Tariffs'
 input_dir = r'L:\Power_Renewables\Inputs'
@@ -904,13 +903,14 @@ def aggregate_plant_list(df_plantlist, yr_start, yr_end, step, name_prefix, offs
     df_existing_cummulative = pd.concat(df_existing_cummulative, ignore_index=True)
     df_existing_cummulative['Yr'] = df_existing_cummulative['Yr'].astype('int')
     df_existing_cummulative = df_existing_cummulative[(df_existing_cummulative['Yr'] >= 2000) & (df_existing_cummulative['Yr'] <= yr_end)]
-    df_existing_cummulative = df_existing_cummulative[df_existing_cummulative['Capacity'] != 0]
     # 对于相同(grouping, StartYear)的记录取最大endyr
     df_existing_cummulative['endyr'] = df_existing_cummulative.groupby(
         ['Resource_Group', 'zREM Technology', 'Fuel', 'zREM County', 'zREM State', 'Area', 'Resource Group', 'StartYear']
     )['endyr'].transform('max')
 
     # when aggregating, create Storage Max Annual_TS for battery types
+    # Calculate StorageMax BEFORE filtering out Capacity==0 rows,
+    # so that BA types with Capacity=0 still get a StorageMax row (with value 0)
     df_existing_cummulative['StorageMaxCap'] = np.where(df_existing_cummulative['Resource Group'].isin(ba_list), df_existing_cummulative[
         'Capacity'] * 4, np.nan)
     df_existing_cummulative['StorageMaxCap'] = np.where(df_existing_cummulative['Resource Group'] == 'Hydro_PS' , df_existing_cummulative[
@@ -918,6 +918,9 @@ def aggregate_plant_list(df_plantlist, yr_start, yr_end, step, name_prefix, offs
     df_storagemax_TS = pd.pivot_table(df_existing_cummulative,
                    index=['Resource_Group', 'zREM Technology', 'Fuel', 'zREM County', 'zREM State', 'Area', 'Resource Group', 'StartYear', 'endyr'],
                    columns='Yr', values='StorageMaxCap', fill_value=0).reset_index()
+
+    # Filter out Capacity==0 rows AFTER StorageMax pivot (so BA types with 0 capacity still get StorageMax entries)
+    df_existing_cummulative = df_existing_cummulative[df_existing_cummulative['Capacity'] != 0]
     if len(df_storagemax_TS) > 0 :
         df_storagemax_TS['StartYear'] = df_storagemax_TS['StartYear'].astype('int')
         df_storagemax_TS['StartYear'] = np.where(df_storagemax_TS['StartYear'] < 2000, 2000, df_storagemax_TS['StartYear'])
@@ -1482,6 +1485,16 @@ def new_get_excel_transmission(path, sheetname_line, sheetname_price):
         ['Model Start Year', 'Special label for profiling', 'Adjusted Cap', 'Source province', 'Destination province'],
         f"{path}:{sheetname_line}",
     )
+    # Rename to standard column names used downstream
+    _txn_renames = {
+        'Source province': 'From Province',
+        'Destination province': 'To Province',
+        'Source regional grid': 'From Region',
+        'Destination regional grid': 'To Region',
+    }
+    _txn_renames = {k: v for k, v in _txn_renames.items()
+                    if k in transmission_data.columns and v not in transmission_data.columns}
+    transmission_data.rename(columns=_txn_renames, inplace=True)
     # Normalize Model Start Year to integer year for merges
     if pd.api.types.is_datetime64_any_dtype(transmission_data['Model Start Year']):
         transmission_data['Model Start Year'] = transmission_data['Model Start Year'].dt.year
@@ -2847,10 +2860,10 @@ def validate_excel_transmission(xls_path, sheet_line, sheet_price):
     df_line = _rename_by_normalized(
         df_line,
         ['Model Start Year', 'Special label for profiling', 'Adjusted Cap', 'Source province', 'Destination province'],
-        "APAC_Transmission_China.xlsm:LiveUpdate",
+        "APAC_Transmission:LiveUpdate",
     )
-    _coerce_int(df_line, ['Model Start Year'], "APAC_Transmission_China.xlsx:LiveUpdate")
-    _coerce_numeric(df_line, ['Adjusted Cap'], "APAC_Transmission_China.xlsx:LiveUpdate")
+    _coerce_int(df_line, ['Model Start Year'], "APAC_Transmission:LiveUpdate")
+    _coerce_numeric(df_line, ['Adjusted Cap'], "APAC_Transmission:LiveUpdate")
 
     try:
         df_price = pd.read_excel(xls_path, sheet_name=sheet_price, usecols="BU:DX")
@@ -2858,7 +2871,7 @@ def validate_excel_transmission(xls_path, sheet_line, sheet_price):
         df_price = pd.read_excel(xls_path, sheet_name=sheet_price)
     # Structure check after header normalization in new_get_excel_transmission
     if df_price.empty:
-        raise ValueError("APAC_Transmission_China.xlsx:T&D Tariffs has no data in BU:DX")
+        raise ValueError("APAC_Transmission:T&D Tariffs has no data in BU:DX")
 
 def validate_excel_hydro(xls_name):
     df_monthly = pd.read_excel(xls_name, sheet_name='Monthly', header=0)
@@ -2965,42 +2978,8 @@ def run_excel_imports():
     step = "excel_imports"
     log_step(step, "validate excel inputs")
     validate_excel_inputs()
-    log_step(step, "read transmission excel")
-    df_txn_all, df_txn_price, df_txn_line = new_get_excel_transmission(path, sheetname_line, sheetname_price)
-    log_df_info(f"{step} transmission liveupdate", df_txn_all)
-    log_df_info(f"{step} transmission tariffs", df_txn_price)
-    log_df_info(f"{step} transmission infra", df_txn_line)
-    skip_txn = should_skip_read(f"{step}_transmission", [df_txn_all, df_txn_price, df_txn_line])
-
-    dest_tbl_all = 'APAC_PowerTransmission_LIVE'
-    dest_tbl_price = 'APAC_PowerTransmission_Tariffs_LIVE'
-    dest_tbl_line = 'APAC_PowerTransmission_InfrastructureProject_LIVE'
-    if not skip_txn:
-        log_step(step, f"write {dest_tbl_all} start")
-        upload_sql(engine=engine_src, df=df_txn_all, dest_sql=dest_tbl_all, existMethod='append')
-        log_step(step, f"write {dest_tbl_all} done rows={len(df_txn_all)}")
-
-    df_txn_all['UpdateCycle'] = cycle
-    df_txn_price['UpdateCycle'] = cycle
-    df_txn_line['UpdateCycle'] = cycle
-    df_txn_all['Dataset_Name'] = datasetname
-    df_txn_price['Dataset_Name'] = datasetname
-    df_txn_line['Dataset_Name'] = datasetname
-
-    dest_tbl_all_d = 'APAC_PowerTransmission_Datasets'
-    dest_tbl_price_d = 'APAC_PowerTransmission_Tariffs_Datasets'
-    dest_tbl_line_d = 'APAC_PowerTransmission_InfrastructureProject_Datasets'
-
-    if not skip_txn:
-        log_step(step, f"write {dest_tbl_all_d} start")
-        upload_sql(engine=engine_src, df=df_txn_all, dest_sql=dest_tbl_all_d, existMethod='append')
-        log_step(step, f"write {dest_tbl_all_d} done rows={len(df_txn_all)}")
-        log_step(step, f"write {dest_tbl_price_d} start")
-        upload_sql(engine=engine_src, df=df_txn_price, dest_sql=dest_tbl_price_d, existMethod='append')
-        log_step(step, f"write {dest_tbl_price_d} done rows={len(df_txn_price)}")
-        log_step(step, f"write {dest_tbl_line_d} start")
-        upload_sql(engine=engine_src, df=df_txn_line, dest_sql=dest_tbl_line_d, existMethod='append')
-        log_step(step, f"write {dest_tbl_line_d} done rows={len(df_txn_line)}")
+    # NOTE: Transmission Excel upload is handled by APAC_Transmission_Uploader_cli.py
+    # and should be run separately before this script.
 
     log_step(step, "read hydro excel")
     df_shape_hydromth, df_AID_HydroVector = get_excel_hydro12mthlyshape(xls_name=hydro_xls)
