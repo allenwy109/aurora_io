@@ -2,3 +2,13 @@ __pycache__/
 debug_*/
 cli_test_logs/
 cache/
+claude/
+archive/
+exports/
+_tmp_exports/
+.claude/settings.local.json
+
+# Vanna query result directories (LocalFileSystem per-user dirs: sha256[:16])
+[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/
+Japan IO code request.xlsx
+TS monthly assumptions.xlsx
