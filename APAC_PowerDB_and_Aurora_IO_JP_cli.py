@@ -228,9 +228,9 @@ input_dir = r'L:\Power_Renewables\Inputs'
 hydro_xls = input_dir + r'\APAC_Hydro.xlsx'
 assumptions_xls = input_dir + r'\APAC_Assumptions.xlsx'
 fuels_xls = input_dir + r'\APAC_Fuels.xlsx'
+ts_monthly_assumptions_xls = input_dir + r'\Japan power modeling\IO code\TS monthly assumptions.xlsx'
 
 ba_list = ['BA', 'BA_PV', 'BA_OW', 'BA_WT', 'Hydro_PS']
-wind_midterm_excluded = {'India', 'Australia', 'Taiwan', 'South Korea', 'Singapore', 'Malaysia'}
 plant_att_tsAnnualAsumpt_list = ['FixedCost', 'EmissionRate_CO2', 'EmissionPrice_CO2']
 yr_start = 2011
 yr_end = 2060
@@ -269,6 +269,7 @@ df_resource = None
 df_resourceGroup = None
 df_resources_raw = None
 storage_table = None
+TS_Monthly_Extra = None
 PlantWind = None
 tmp_wind_EmissionRate = None
 tmp_wind_EmissionPrice = None
@@ -281,6 +282,7 @@ def reset_runtime_state():
     global ts_annual_assumptions, TS_Annual_PlantExisting, TS_Annual_PlantNew
     global TS_StorageMax_Exist, TS_StorageMax_New, df_resource, df_resourceGroup
     global PlantWind, tmp_wind_EmissionRate, tmp_wind_EmissionPrice
+    global TS_Monthly_Extra
     TS_Weekly = None
     TS_Monthly = None
     Maint_mth = None
@@ -303,6 +305,7 @@ def reset_runtime_state():
     PlantWind = None
     tmp_wind_EmissionRate = None
     tmp_wind_EmissionPrice = None
+    TS_Monthly_Extra = None
 
 
 def step_ready(step_name):
@@ -315,9 +318,7 @@ def step_ready(step_name):
     if step_name == "plants_newbuild":
         return Plant_New is not None and TS_Annual_PlantNew is not None and TS_StorageMax_New is not None
     if step_name == "resources":
-        if country not in wind_midterm_excluded:
-            return PlantExisting is not None and Plant_New is not None and ts_annual_assumptions is not None and PlantWind is not None
-        return PlantExisting is not None and Plant_New is not None and ts_annual_assumptions is not None
+        return PlantExisting is not None and Plant_New is not None and ts_annual_assumptions is not None and PlantWind is not None
     if step_name == "emission":
         return (
             EmissionRate is not None and EmissionPrice is not None and
@@ -3057,6 +3058,21 @@ def run_excel_imports():
         upload_sql(engine=engine_src, df=df_fuel, dest_sql=dest_tbl, existMethod='append')
         log_step(step, f"write {dest_tbl} done rows={len(df_fuel)}")
 
+    # Read TS monthly assumptions Excel
+    global TS_Monthly_Extra
+    log_step(step, "read TS monthly assumptions excel")
+    try:
+        df_ts_mth_extra = pd.read_excel(ts_monthly_assumptions_xls, sheet_name='TS_Monthly', header=0)
+        df_ts_mth_extra.columns = [c if isinstance(c, str) else c for c in df_ts_mth_extra.columns]
+        log_df_info(f"{step} ts_monthly_extra", df_ts_mth_extra)
+        TS_Monthly_Extra = df_ts_mth_extra
+    except FileNotFoundError:
+        log_step(step, f"WARNING: TS monthly assumptions file not found: {ts_monthly_assumptions_xls}")
+        TS_Monthly_Extra = None
+    except Exception as e:
+        log_step(step, f"WARNING: failed to read TS monthly assumptions: {e}")
+        TS_Monthly_Extra = None
+
 
 def run_topology():
     step = "topology"
@@ -3106,10 +3122,22 @@ def run_transmission():
     )
     log_df_info(f"{step} links", transmission_link)
     log_df_info(f"{step} ts_annual", ts_annual_txlink)
-    if should_skip_read(step, [transmission_link, ts_annual_txlink], ts_annual_module_key="transmission"):
+    extra_inputs = [TS_Monthly_Extra] if TS_Monthly_Extra is not None else []
+    if should_skip_read(step, [transmission_link, ts_annual_txlink] + extra_inputs, ts_annual_module_key="transmission"):
         log_step(step, "read hash unchanged; skip compute/write")
         return
     log_step(step, "write transmission tables start")
+    # Add Link Capacity Shape from TS monthly assumptions
+    if TS_Monthly_Extra is not None:
+        shape_ids = [str(sid) for sid in TS_Monthly_Extra['ID'].dropna().unique()
+                     if str(sid).startswith('shape_')]
+        tx_id_to_shape = {}
+        for sid in shape_ids:
+            link_id = sid.replace('shape_', '', 1)
+            tx_id_to_shape[link_id] = 'mn_' + sid
+        if tx_id_to_shape and 'ID' in transmission_link.columns:
+            transmission_link['Link Capacity Shape'] = transmission_link['ID'].map(tx_id_to_shape)
+            log_step(step, f"mapped Link Capacity Shape for {transmission_link['Link Capacity Shape'].notna().sum()} links")
     reload_tbl(engine=engine_dest, dest_tbl='tbl_AID_Transmission_Links', dest_df=transmission_link)
     update_aid_id(dest_tbl='tbl_AID_Time_Series_Annual', dest_df=ts_annual_txlink, module_key="transmission")
     log_step(step, "write transmission tables done")
@@ -3148,7 +3176,8 @@ def run_shapes():
     log_df_info(f"{step} TS_Monthly", ts_monthly)
     log_df_info(f"{step} Maint_mth", maint_mth)
     log_df_info(f"{step} Maint_wk", maint_wk)
-    if should_skip_read(step, [ts_weekly, ts_monthly, maint_mth, maint_wk]):
+    extra_inputs = [TS_Monthly_Extra] if TS_Monthly_Extra is not None else []
+    if should_skip_read(step, [ts_weekly, ts_monthly, maint_mth, maint_wk] + extra_inputs):
         log_step(step, "read hash unchanged; skip compute/write")
         return
 
@@ -3161,14 +3190,6 @@ def run_shapes():
                                                 np.where(Maint_mth['ShapeName'].str.contains('PV'), 'PV',
                                                   np.where(Maint_mth['ShapeName'].str.contains('Onshore'), 'Wind_Onshore',
                                                     np.where(Maint_mth['ShapeName'].str.contains('Offshore'), 'Wind_Offshore', 'NewShape')))))
-    Maint_mth['ID'] = Maint_mth['ID'].str.replace('East Central South Kalimantan', 'ECS Kalimantan')
-    Maint_mth['ID'] = Maint_mth['ID'].str.replace('Papua Timor Maluku Nusa Tenggara', 'Timor')
-    TS_Weekly['ID'] = TS_Weekly['ID'].str.replace('East Central South Kalimantan', 'ECS Kalimantan')
-    TS_Weekly['ID'] = TS_Weekly['ID'].str.replace('Papua Timor Maluku Nusa Tenggara', 'Timor')
-    col_lst = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 'ID']
-    for col in col_lst:
-        TS_Monthly[col] = TS_Monthly[col].str.replace('East Central South Kalimantan', 'ECS Kalimantan')
-        TS_Monthly[col] = TS_Monthly[col].str.replace('Papua Timor Maluku Nusa Tenggara', 'Timor')
 
     TS_Weekly = TS_Weekly.drop(['Month'], axis=1)
     TS_Weekly.rename(columns={'Area': 'zREM Topology', 'ShapeName': 'zREM Type'}, inplace=True)
@@ -3198,6 +3219,15 @@ def run_shapes():
     if hr_cols:
         TS_Weekly[hr_cols] = TS_Weekly[hr_cols].apply(pd.to_numeric, errors='coerce').clip(lower=0)
     log_step(step, "write weekly/monthly tables start")
+    # Append TS monthly assumptions extra rows before writing
+    if TS_Monthly_Extra is not None:
+        extra = TS_Monthly_Extra.copy()
+        # Ensure month columns are numeric (1..12)
+        for m in range(1, 13):
+            if m in extra.columns:
+                extra[m] = pd.to_numeric(extra[m], errors='coerce')
+        TS_Monthly = pd.concat([TS_Monthly, extra], ignore_index=True)
+        log_step(step, f"appended {len(extra)} rows from TS monthly assumptions")
     reload_tbl(engine=engine_dest, dest_tbl='tbl_AID_Time_Series_Weekly', dest_df=TS_Weekly)
     reload_tbl(engine=engine_dest, dest_tbl='tbl_AID_Time_Series_Monthly', dest_df=TS_Monthly)
     log_step(step, "write weekly/monthly tables done")
@@ -3256,10 +3286,9 @@ def run_plants_newbuild():
     Plant_New = get_sql_plant_newbuild(src_sql='vAPAC_PowerProjects_NewBuild_LIVE', country=country)
     log_df_info(f"{step} raw", Plant_New)
     Plant_Wind = None
-    if country not in wind_midterm_excluded:
-        log_step(step, "read wind project list start")
-        Plant_Wind = get_sql_wind_plant_existing(src_sql='vAPAC_WindProjectList_LIVE', country=country)
-        log_df_info(f"{step} wind raw", Plant_Wind)
+    log_step(step, "read wind project list start")
+    Plant_Wind = get_sql_wind_plant_existing(src_sql='vAPAC_WindProjectList_LIVE', country=country)
+    log_df_info(f"{step} wind raw", Plant_Wind)
     read_inputs = [Plant_New] + ([Plant_Wind] if Plant_Wind is not None else [])
     if should_skip_read(step, read_inputs):
         log_step(step, "read hash unchanged; skip compute/write")
@@ -3286,7 +3315,7 @@ def run_plants_newbuild():
     log_df_info(f"{step} final", Plant_New)
     log_step(step, "apply shapes/maintenance done")
 
-    if country not in wind_midterm_excluded and Plant_Wind is not None:
+    if Plant_Wind is not None:
         PlantWind = assign_assumptions(df=Plant_Wind)
         PlantWind, _tmp = assign_tsannual_assumptions(df=PlantWind)
         PlantWind, tmp_wind_EmissionRate, tmp_wind_EmissionPrice = apply_emissions(df=PlantWind)
@@ -3322,7 +3351,7 @@ def run_resources_load():
         frames.append(PlantExisting)
     if Plant_New is not None:
         frames.append(Plant_New)
-    if country not in wind_midterm_excluded and PlantWind is not None:
+    if PlantWind is not None:
         frames.append(PlantWind)
     df_resources_raw = pd.concat(frames, axis=0, ignore_index=True) if frames else pd.DataFrame()
     log_df_info(f"{step} combined resources raw", df_resources_raw)
@@ -3499,6 +3528,67 @@ def run_postprocess_resource():
         (df_resource['zREM Technology'].isin(['PV', 'PV_D', 'PV_BA', 'WT_BA', 'OW_BA', 'Wind_Onshore', 'Wind_Offshore'])),
         10, df_resource['Minimum Capacity'])
 
+    # --- TS monthly assumptions: Coal/Gas/Nuclear resource rules ---
+    if TS_Monthly_Extra is not None:
+        if 'Capacity Monthly Shape' not in df_resource.columns:
+            df_resource['Capacity Monthly Shape'] = np.nan
+
+        # Coal: Forced Outage = mn_Thermal_RO, Maintenance Rate = mn_{County}_coal_FO, CMS = 0.95
+        coal_mask = df_resource['zREM Secondary'] == 'Coal'
+        if coal_mask.any():
+            df_resource.loc[coal_mask, 'Forced Outage'] = 'mn_Thermal_RO'
+            df_resource.loc[coal_mask, 'Maintenance Rate'] = (
+                'mn_' + df_resource.loc[coal_mask, 'zREM County'].astype(str) + '_coal_FO'
+            )
+            df_resource.loc[coal_mask, 'Capacity Monthly Shape'] = 0.95
+            log_step(step, f"applied Coal resource rules: {int(coal_mask.sum())} plants")
+
+        # Gas: Forced Outage = mn_Thermal_RO, Maintenance Rate = mn_{County}_gas_FO, CMS = 0.95
+        gas_mask = df_resource['zREM Secondary'] == 'Gas'
+        if gas_mask.any():
+            df_resource.loc[gas_mask, 'Forced Outage'] = 'mn_Thermal_RO'
+            df_resource.loc[gas_mask, 'Maintenance Rate'] = (
+                'mn_' + df_resource.loc[gas_mask, 'zREM County'].astype(str) + '_gas_FO'
+            )
+            df_resource.loc[gas_mask, 'Capacity Monthly Shape'] = 0.95
+            log_step(step, f"applied Gas resource rules: {int(gas_mask.sum())} plants")
+
+        # Nuclear: match Forced Outage to mn_nuclear_{name}_FO from TS_Monthly_Extra
+        nuc_mask = df_resource['zREM Secondary'] == 'Nuclear'
+        if nuc_mask.any():
+            nuclear_ids = [str(sid) for sid in TS_Monthly_Extra['ID'].dropna().unique()
+                           if str(sid).startswith('nuclear_')]
+            end_col = 'Resource End Date'
+            if end_col in df_resource.columns:
+                end_year = pd.to_datetime(df_resource[end_col], errors='coerce').dt.year
+                active_nuc = nuc_mask & (end_year >= 2025)
+                retired_nuc = nuc_mask & (end_year < 2025)
+            else:
+                active_nuc = nuc_mask
+                retired_nuc = pd.Series(False, index=df_resource.index)
+
+            matched_count = 0
+            for idx in df_resource.index[active_nuc]:
+                plant_name = str(df_resource.loc[idx, 'Name'])
+                matched_id = None
+                for nid in nuclear_ids:
+                    name_part = nid.replace('nuclear_', '', 1).replace('_FO', '')
+                    if name_part in plant_name or plant_name in name_part:
+                        matched_id = nid
+                        break
+                if matched_id:
+                    df_resource.loc[idx, 'Forced Outage'] = 'mn_' + matched_id
+                    matched_count += 1
+                else:
+                    log_step(step, f"WARNING: no nuclear FO match for '{plant_name}'")
+
+            if retired_nuc.any():
+                df_resource.loc[retired_nuc, 'Forced Outage'] = np.nan
+
+            log_step(step, f"applied Nuclear resource rules: active={int(active_nuc.sum())} "
+                           f"(matched={matched_count}), retired={int(retired_nuc.sum())}")
+    # --- end TS monthly assumptions resource rules ---
+
     df_resourceGroup = df_resource[['Resource Group', 'Resource Group', 'zREM Secondary', 'zREM County']].reset_index(drop=True)
     df_resourceGroup.columns = ['Number', 'Name', 'Technology Name', 'Zone Name']
     df_resourceGroup.drop_duplicates(inplace=True)
@@ -3601,6 +3691,14 @@ def run_constraints():
         }])
     ], ignore_index=True)
     Fuel_local = Fuel_local.reset_index(drop=True)
+
+    # Add Monthly Shape Vector based on Fuel Type
+    Fuel_local['Monthly Shape Vector'] = None
+    coal_mask = Fuel_local['Fuel Type'] == 'Coal'
+    gas_mask = Fuel_local['Fuel Type'].isin(['Gas', 'LNG'])
+    Fuel_local.loc[coal_mask, 'Monthly Shape Vector'] = 'mn_Japan_Coal_Price'
+    Fuel_local.loc[gas_mask, 'Monthly Shape Vector'] = 'mn_Japan_LNG_Price'
+    log_step(step, f"assigned Monthly Shape Vector: Coal={int(coal_mask.sum())}, Gas/LNG={int(gas_mask.sum())}")
 
     log_step(step, "write tbl_AID_Fuel start")
     reload_tbl(engine=engine_dest, dest_tbl='tbl_AID_Fuel', dest_df=Fuel_local)
