@@ -221,8 +221,6 @@ aurora_sqldb = 'ANVDEVSQLVPM01'
 #aurora_dbname = 'Aurora_APAC_DEV_' + aid_country
 aurora_dbname = 'Aurora_APAC_DEV_' + aid_country + '_test' #Allen test db
 # aurora_dbname = 'Aurora_APAC_DEV'
-sheetname_line = 'LiveUpdate'
-sheetname_price = 'T&D Tariffs'
 input_dir = r'L:\Power_Renewables\Inputs'
 hydro_xls = input_dir + r'\APAC_Hydro.xlsx'
 assumptions_xls = input_dir + r'\APAC_Assumptions.xlsx'
@@ -920,7 +918,10 @@ def aggregate_plant_list(df_plantlist, yr_start, yr_end, step, name_prefix, offs
                    columns='Yr', values='StorageMaxCap', fill_value=0).reset_index()
 
     # Filter out Capacity==0 rows AFTER StorageMax pivot (so BA types with 0 capacity still get StorageMax entries)
-    df_existing_cummulative = df_existing_cummulative[df_existing_cummulative['Capacity'] != 0]
+    # Keep BA types (BA, BA_PV, BA_WT, BA_OW, Hydro_PS) even if Capacity==0, as they serve as resource placeholders
+    df_existing_cummulative = df_existing_cummulative[
+        (df_existing_cummulative['Capacity'] != 0) | (df_existing_cummulative['Resource Group'].isin(ba_list))
+    ]
     if len(df_storagemax_TS) > 0 :
         df_storagemax_TS['StartYear'] = df_storagemax_TS['StartYear'].astype('int')
         df_storagemax_TS['StartYear'] = np.where(df_storagemax_TS['StartYear'] < 2000, 2000, df_storagemax_TS['StartYear'])
@@ -1468,193 +1469,6 @@ def update_sqltbl_by(engine, dest_tbl, dest_df, by_col):
     return
 
 
-# Functions to Read Excel Data & Transform to Flat format for upload to SQL db
-def new_get_excel_transmission(path, sheetname_line, sheetname_price):
-    # Ying to paste her code here
-
-    transmission_data = pd.read_excel(path, sheet_name=sheetname_line, header=1)
-    transmission_data = _apply_alias_columns(
-        transmission_data,
-        {
-            "Source province": ["From Region", "From Regio"],
-            "Destination province": ["To Region", "To Regio"],
-        },
-    )
-    transmission_data = _rename_by_normalized(
-        transmission_data,
-        ['Model Start Year', 'Special label for profiling', 'Adjusted Cap', 'Source province', 'Destination province'],
-        f"{path}:{sheetname_line}",
-    )
-    # Rename to standard column names used downstream
-    _txn_renames = {
-        'Source province': 'From Province',
-        'Destination province': 'To Province',
-        'Source regional grid': 'From Region',
-        'Destination regional grid': 'To Region',
-    }
-    _txn_renames = {k: v for k, v in _txn_renames.items()
-                    if k in transmission_data.columns and v not in transmission_data.columns}
-    transmission_data.rename(columns=_txn_renames, inplace=True)
-    # Normalize Model Start Year to integer year for merges
-    if pd.api.types.is_datetime64_any_dtype(transmission_data['Model Start Year']):
-        transmission_data['Model Start Year'] = transmission_data['Model Start Year'].dt.year
-    else:
-        transmission_data['Model Start Year'] = pd.to_numeric(
-            transmission_data['Model Start Year'], errors="coerce"
-        )
-    transmission_data['Model Start Year'] = transmission_data['Model Start Year'].astype("Int64")
-    # max dataset
-    date_range = pd.DataFrame(range(2000, yr_end+1))
-    date_range.columns = ['Year']
-    date_range['Year'] = date_range['Year'].astype('Int64')
-    df_rows = []
-    for row in transmission_data.iterrows():
-        data_row = row[1].to_frame().T
-        if 'Model Start Year' in data_row.columns:
-            data_row['Model Start Year'] = pd.to_numeric(
-                data_row['Model Start Year'], errors='coerce'
-            ).astype('Int64')
-        df_row = data_row.merge(date_range, how='outer', left_on='Model Start Year', right_on='Year')
-        df_row = df_row.ffill().infer_objects(copy=False)
-        df_row['Year'] = pd.to_numeric(df_row['Year'], errors='coerce')
-        df_row['Model Start Year'] = pd.to_numeric(df_row['Model Start Year'], errors='coerce')
-        df_row['Year'] = df_row['Year'].fillna(df_row['Model Start Year'])
-        df_row['Model Start Year'] = df_row['Model Start Year'].fillna(df_row['Year'])
-        df_row['Year'] = df_row['Year'].astype(int)
-        df_row['Model Start Year'] = df_row['Model Start Year'].astype(int)
-        df_row['Value'] = np.where((df_row['Year'] == df_row['Model Start Year']) & (df_row['Special label for profiling'] == 'F'),df_row['Adjusted Cap'] * 0.7,
-                        np.where((df_row['Year'] == df_row['Model Start Year'] + 1) & (df_row['Special label for profiling'] == 'F'),df_row['Adjusted Cap'] * 0.9,
-                        np.where((df_row['Year'] == df_row['Model Start Year']) & (df_row['Special label for profiling'] == 'L'),df_row['Adjusted Cap'] * 0.3,
-                        np.where((df_row['Year'] == df_row['Model Start Year'] + 1) & (df_row['Special label for profiling'] == 'L'), df_row['Adjusted Cap'] * 0.6,
-                        np.where((df_row['Year'] == df_row['Model Start Year'] + 2) & (df_row['Special label for profiling'] == 'L'),df_row['Adjusted Cap'] * 0.8,
-                        np.where((df_row['Year'] < df_row['Model Start Year']),                                                        0,
-                        np.where( df_row['Special label for profiling'] == 'NA',    df_row['Adjusted Cap']*1,df_row['Adjusted Cap'])))))))
-
-        df_row = df_row.dropna(axis=1, how='all')
-        if not df_row.empty and not df_row.isna().all().all():
-            df_rows.append(df_row)
-    df_rows = [d for d in df_rows if d is not None and not d.empty and d.notna().any().any()]
-    df = pd.concat(df_rows, ignore_index=True) if df_rows else pd.DataFrame()
-    df['Type'] = 'Max'
-    df['Unit'] = 'MW'
-    df['Metric'] = 'Capacity'
-
-    # min dataset
-    df_min = df.copy()
-    df_min['Type'] = 'Min'
-    df_min['Value'] = df_min['Value'] * 0.5
-
-    # price data
-    def _parse_price_sheet(xls_path, sheet):
-        try:
-            raw = pd.read_excel(xls_path, sheet_name=sheet, usecols="BU:DX")
-        except ValueError:
-            raw = pd.read_excel(xls_path, sheet_name=sheet)
-        raw = raw.dropna(axis=0, how="all").dropna(axis=1, how="all")
-        header_idx = None
-        max_scan = min(15, len(raw))
-        for i in range(max_scan):
-            row = raw.iloc[i].astype(str).str.strip().str.lower()
-            if row.str.contains(
-                "interconnection|power link name|source province|destination province|from province|to province"
-            ).any():
-                header_idx = i
-                break
-        if header_idx is not None:
-            raw.columns = raw.iloc[header_idx]
-            raw = raw.iloc[header_idx + 1 :].reset_index(drop=True)
-        raw = raw.dropna(axis=0, how="all").dropna(axis=1, how="all").reset_index(drop=True)
-        if len(raw) > 0 and any(pd.isna(c) or str(c).strip() == "" for c in raw.columns):
-            first_row = raw.iloc[0]
-            new_cols = []
-            for c, v in zip(raw.columns, first_row):
-                if pd.isna(c) or str(c).strip() == "":
-                    new_cols.append(v)
-                else:
-                    new_cols.append(c)
-            raw.columns = new_cols
-            raw = raw.iloc[1:].reset_index(drop=True)
-        return raw
-
-    price_data = _parse_price_sheet(path, sheetname_price)
-    price_data = _apply_alias_columns(
-        price_data,
-        {
-            "Power link name": ["Power link", "PowerLink name", "Link name", "Interconnection name"],
-            "Source province": ["Source Province", "From Province", "From Region"],
-            "Destination province": ["Destination Province", "To Province", "To Region"],
-            "Source regional grid": ["Source region grid", "Source region", "From regional grid", "From region grid", "Source grid"],
-            "Destination regional grid": ["Destination region grid", "Destination region", "To regional grid", "To region grid", "Destination grid"],
-        },
-    )
-    price_data = _rename_by_normalized_optional(
-        price_data,
-        [
-            "Power link name",
-            "Source province",
-            "Source regional grid",
-            "Destination province",
-            "Destination regional grid",
-        ],
-    )
-    if "Interconnection" not in price_data.columns and "Source province" in price_data.columns and "Destination province" in price_data.columns:
-        price_data['Interconnection'] = price_data['Source province'] + '-' + price_data['Destination province']
-    if "Interconnection" not in price_data.columns:
-        raise ValueError(f"{path}:{sheetname_price}: missing columns (need Interconnection or Source/Destination province)")
-    id_vars = [c for c in [
-        "Power link name",
-        "Source province",
-        "Source regional grid",
-        "Destination province",
-        "Destination regional grid",
-        "Interconnection",
-    ] if c in price_data.columns]
-    price_data = pd.melt(price_data, id_vars=id_vars, var_name='Year', value_name='Value')
-    price_data['Year'] = pd.to_numeric(price_data['Year'], errors='coerce')
-    price_data = price_data[price_data['Year'].notna()].reset_index(drop=True)
-    price_data['Year'] = price_data['Year'].astype(int)
-    price_line = df.merge(price_data, how='left', on=['Interconnection', 'Year'])
-    price_line['Type'] = 'Flat'
-    price_line['Unit'] = 'US$/MWh'
-    price_line['Metric'] = 'Wheeling'
-    wheeling_cols = [
-        'ID', 'Transmission Line Name', 'Chinese Name', 'Status',
-        'Number of Loops', 'Interconnection', 'From Province', 'From Region',
-        'To Province', 'To Region', 'Primary Fuel',
-        'Special label for profiling', 'Length (km)', 'DC/AC', 'Voltage Grade',
-        'Capacity (MW)', 'Deduction coefficient', 'Adjusted Cap',
-        'Construction commencement', 'COD', 'COD year', 'Model Start Year',
-        'Capex (Mn RMB)', 'Commentaries', 'Year', 'Value_y', 'Type', 'Unit', 'Metric'
-    ]
-    wheeling = price_line[[c for c in wheeling_cols if c in price_line.columns]].copy()
-    if 'Value_y' in wheeling.columns:
-        wheeling.rename(columns={'Value_y': 'Value'}, inplace=True)
-
-    # original table prepared to upload to DB
-    price_tariff_orig = price_data.copy()
-    price_tariff_orig['TimeStamp'] = timestamp
-    transmission_line_orig = transmission_data.copy()
-    transmission_line_orig['TimeStamp'] = timestamp
-
-    # concat back to single df after fillna
-    df_all = pd.concat([df, df_min, wheeling], ignore_index=True)
-    df_all['Year'] = df_all['Year'].astype(int)
-    df_all['Country'] = country
-
-    # re-order
-    df_all_cols = [
-        'ID', 'Country', 'Transmission Line Name', 'Chinese Name', 'Status',
-        'Number of Loops', 'Interconnection', 'From Province', 'From Region',
-        'To Province', 'To Region', 'Primary Fuel',
-        'Special label for profiling', 'Length (km)', 'DC/AC', 'Voltage Grade',
-        'Capacity (MW)', 'Deduction coefficient', 'Adjusted Cap',
-        'Construction commencement', 'COD', 'COD year', 'Model Start Year',
-        'Capex (Mn RMB)', 'Year', 'Metric', 'Value', 'Type', 'Unit', 'Commentaries'
-    ]
-    df_all = df_all[[c for c in df_all_cols if c in df_all.columns]]
-    df_all['User'] = user
-    df_all['TimeStamp'] = timestamp
-    return df_all, price_tariff_orig, transmission_line_orig
 
 def get_excel_hydro12mthlyshape(xls_name):
     """
@@ -2848,30 +2662,6 @@ def _coerce_numeric(df, cols, name):
             except Exception as exc:
                 raise ValueError(f"{name}: column '{c}' cannot be numeric") from exc
 
-def validate_excel_transmission(xls_path, sheet_line, sheet_price):
-    df_line = pd.read_excel(xls_path, sheet_name=sheet_line, header=1)
-    df_line = _apply_alias_columns(
-        df_line,
-        {
-            "Source province": ["From Region", "From Regio"],
-            "Destination province": ["To Region", "To Regio"],
-        },
-    )
-    df_line = _rename_by_normalized(
-        df_line,
-        ['Model Start Year', 'Special label for profiling', 'Adjusted Cap', 'Source province', 'Destination province'],
-        "APAC_Transmission:LiveUpdate",
-    )
-    _coerce_int(df_line, ['Model Start Year'], "APAC_Transmission:LiveUpdate")
-    _coerce_numeric(df_line, ['Adjusted Cap'], "APAC_Transmission:LiveUpdate")
-
-    try:
-        df_price = pd.read_excel(xls_path, sheet_name=sheet_price, usecols="BU:DX")
-    except ValueError:
-        df_price = pd.read_excel(xls_path, sheet_name=sheet_price)
-    # Structure check after header normalization in new_get_excel_transmission
-    if df_price.empty:
-        raise ValueError("APAC_Transmission:T&D Tariffs has no data in BU:DX")
 
 def validate_excel_hydro(xls_name):
     df_monthly = pd.read_excel(xls_name, sheet_name='Monthly', header=0)
@@ -2903,7 +2693,7 @@ def validate_excel_fuel(xls_name):
     )
 
 def validate_excel_inputs():
-    validate_excel_transmission(path, sheetname_line, sheetname_price)
+    # NOTE: Transmission Excel validation is handled by APAC_Transmission_Uploader_cli.py
     validate_excel_hydro(hydro_xls)
     validate_excel_assumptions(assumptions_xls)
     validate_excel_fuel(fuels_xls)
@@ -3453,12 +3243,13 @@ def run_postprocess_resource():
 
     if 'Hydro Number' not in df_resource.columns:
         df_resource['Hydro Number'] = np.nan
-    area_name_col = 'Area Name'
+    # Hydro Number should be the province name (zREM County), not the zone ID (Area)
+    area_name_col = 'zREM County'
     if area_name_col not in df_resource.columns:
-        if 'Area' in df_resource.columns:
+        if 'Area Name' in df_resource.columns:
+            area_name_col = 'Area Name'
+        elif 'Area' in df_resource.columns:
             area_name_col = 'Area'
-        elif 'Zone' in df_resource.columns:
-            area_name_col = 'Zone'
         else:
             area_name_col = None
     if area_name_col is not None:
