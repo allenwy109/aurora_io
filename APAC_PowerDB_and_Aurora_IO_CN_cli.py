@@ -181,6 +181,14 @@ try:
     pd.set_option("future.no_silent_downcasting", True)
 except Exception:
     pass
+
+# Compatibility: pandas < 2.0 does not support infer_objects(copy=...)
+import inspect as _inspect
+if 'copy' not in _inspect.signature(pd.DataFrame.infer_objects).parameters:
+    _orig_df_infer = pd.DataFrame.infer_objects
+    _orig_sr_infer = pd.Series.infer_objects
+    pd.DataFrame.infer_objects = lambda self, *a, **kw: _orig_df_infer(self, *a, **{k: v for k, v in kw.items() if k != 'copy'})
+    pd.Series.infer_objects = lambda self, *a, **kw: _orig_sr_infer(self, *a, **{k: v for k, v in kw.items() if k != 'copy'})
 import numpy as np
 import polars as pl
 import os
@@ -892,9 +900,9 @@ def aggregate_plant_list(df_plantlist, yr_start, yr_end, step, name_prefix, offs
                                                            'Area', 'Resource Group'], as_index=False)['Capacity'].agg('sum')
 
         df_existing_cum['StartYear'] = df_existing_cum.groupby(['Resource_Group', 'zREM Technology', 'Fuel', 'zREM County', 'zREM State',
-                                          'Area', 'Resource Group'], as_index=False)['Yr'].transform('min')
+                                          'Area', 'Resource Group'])['Yr'].transform('min')
         df_existing_cum['endyr'] = df_existing_cum.groupby(['Resource_Group', 'zREM Technology', 'Fuel', 'zREM County', 'zREM State',
-                                                     'Area', 'Resource Group'], as_index=False)['Yr'].transform('max')
+                                                     'Area', 'Resource Group'])['Yr'].transform('max')
         if len(df_existing_cum) > 0:
             df_existing_cummulative.append(df_existing_cum)
 
@@ -1972,7 +1980,7 @@ def get_sql_windsolarshapes_to_aid_ts_wek(src_sql, country, year_start=None, yea
     df['ShapeType'] = df['ShapeType'].str.replace('Sun', 'PV')
     df = df.sort_values(by=['Country', 'ModelZone', 'ShapeType', 'ShapeName', 'Year', 'Month', 'DayOfWeek',
                             'HourOfDay']).reset_index(drop=True)
-    df['AnnualAverageShape'] = df.groupby(['Country', 'ModelZone', 'ShapeType', 'ShapeName', 'Year'], as_index=False)[
+    df['AnnualAverageShape'] = df.groupby(['Country', 'ModelZone', 'ShapeType', 'ShapeName', 'Year'])[
         'AID_WeeklyShape'].transform('mean')
     df.rename(columns={'ShapeType': 'PlantType', 'AID_WeeklyShape': 2019}, inplace=True)
 
@@ -2290,6 +2298,11 @@ def apply_solar_wind_shapes_to_plants(df_maint_mth, df_plant):
     maint_rate = df_maint_mth[['Area', 'Resource Group', 'ID']].reset_index(drop=True)
     maint_rate.rename(columns={'ID': 'Maintenance Rate'}, inplace=True)
     maint_rate = maint_rate.drop_duplicates()
+
+    if len(df_maint_mth) == 0 or df_maint_mth['Level'].dropna().empty:
+        # No maintenance shape data available; skip merge
+        df_plant['Maintenance Rate'] = np.nan
+        return df_plant
 
     if df_maint_mth['Level'].unique()[0] == 'ModelZone':
         df_plant = pd.merge(df_plant, maint_rate, how='left', left_on=['zREM County', 'Resource Group'], right_on=['Area',
